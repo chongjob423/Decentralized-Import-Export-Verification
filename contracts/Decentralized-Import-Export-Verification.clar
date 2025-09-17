@@ -7,10 +7,15 @@
 (define-constant err-insufficient-stake (err u105))
 (define-constant err-trade-expired (err u106))
 (define-constant err-invalid-verification (err u107))
+(define-constant err-currency-not-supported (err u108))
+(define-constant err-insufficient-balance (err u109))
+(define-constant err-invalid-exchange-rate (err u110))
 
 (define-data-var trade-id-nonce uint u0)
 (define-data-var min-stake-amount uint u1000)
 (define-data-var verification-window uint u1440)
+(define-data-var stx-usd-rate uint u100000)
+(define-data-var supported-currencies-count uint u0)
 
 (define-map trades
     uint
@@ -77,6 +82,41 @@
     }
 )
 
+(define-map supported-currencies
+    principal
+    {
+        is-active: bool,
+        currency-symbol: (string-ascii 10),
+        decimal-places: uint,
+        usd-exchange-rate: uint,
+        min-trade-amount: uint,
+        created-at: uint,
+    }
+)
+
+(define-map currency-balances
+    {
+        user: principal,
+        currency: principal,
+    }
+    {
+        available: uint,
+        locked: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map multi-currency-trades
+    uint
+    {
+        base-currency: principal,
+        quote-currency: principal,
+        exchange-rate: uint,
+        currency-locked-amount: uint,
+        settlement-currency: principal,
+    }
+)
+
 (define-public (register-verifier (reputation-stake uint))
     (let ((current-verifier (map-get? verifiers tx-sender)))
         (asserts! (is-none current-verifier) err-already-exists)
@@ -132,6 +172,76 @@
             locked-at: stacks-block-height,
             released: false,
         })
+        (var-set trade-id-nonce trade-id)
+        (ok trade-id)
+    )
+)
+
+(define-public (create-multi-currency-trade
+        (importer principal)
+        (goods-hash (buff 32))
+        (quantity uint)
+        (value uint)
+        (stake-amount uint)
+        (trade-currency principal)
+        (settlement-currency principal)
+    )
+    (let (
+            (trade-id (+ (var-get trade-id-nonce) u1))
+            (expiry-block (+ stacks-block-height (var-get verification-window)))
+            (currency-info (unwrap! (map-get? supported-currencies trade-currency)
+                err-currency-not-supported
+            ))
+            (settlement-info (unwrap! (map-get? supported-currencies settlement-currency)
+                err-currency-not-supported
+            ))
+            (exchange-rate (calculate-exchange-rate trade-currency settlement-currency))
+        )
+        (asserts! (get is-active currency-info) err-currency-not-supported)
+        (asserts! (get is-active settlement-info) err-currency-not-supported)
+        (asserts! (>= value (get min-trade-amount currency-info))
+            err-insufficient-stake
+        )
+        (asserts! (>= stake-amount (var-get min-stake-amount))
+            err-insufficient-stake
+        )
+
+        (try! (stx-transfer? (calculate-stx-equivalent trade-currency value) tx-sender
+            (as-contract tx-sender)
+        ))
+        (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+
+        (map-set trades trade-id {
+            exporter: tx-sender,
+            importer: importer,
+            verifier: none,
+            goods-hash: goods-hash,
+            quantity: quantity,
+            value: value,
+            status: "pending",
+            created-at: stacks-block-height,
+            verified-at: none,
+            expires-at: expiry-block,
+            stake-amount: stake-amount,
+        })
+
+        (map-set multi-currency-trades trade-id {
+            base-currency: trade-currency,
+            quote-currency: settlement-currency,
+            exchange-rate: exchange-rate,
+            currency-locked-amount: value,
+            settlement-currency: settlement-currency,
+        })
+
+        (map-set user-stakes {
+            user: tx-sender,
+            trade-id: trade-id,
+        } {
+            amount: stake-amount,
+            locked-at: stacks-block-height,
+            released: false,
+        })
+
         (var-set trade-id-nonce trade-id)
         (ok trade-id)
     )
@@ -232,6 +342,7 @@
         (if verification-result
             (begin
                 (try! (release-stakes trade-id))
+                (try! (release-multi-currency-funds trade-id))
                 (try! (pay-verifier verifier-address (/ (get value trade) u100)))
                 (ok verification-result)
             )
@@ -337,6 +448,60 @@
     )
 )
 
+(define-public (register-currency
+        (currency-contract principal)
+        (symbol (string-ascii 10))
+        (decimals uint)
+        (initial-rate uint)
+        (min-amount uint)
+    )
+    (let ((existing-currency (map-get? supported-currencies currency-contract)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none existing-currency) err-already-exists)
+        (asserts! (> initial-rate u0) err-invalid-exchange-rate)
+        (map-set supported-currencies currency-contract {
+            is-active: true,
+            currency-symbol: symbol,
+            decimal-places: decimals,
+            usd-exchange-rate: initial-rate,
+            min-trade-amount: min-amount,
+            created-at: stacks-block-height,
+        })
+        (var-set supported-currencies-count
+            (+ (var-get supported-currencies-count) u1)
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-exchange-rate
+        (currency-contract principal)
+        (new-rate uint)
+    )
+    (let ((currency-info (unwrap! (map-get? supported-currencies currency-contract)
+            err-currency-not-supported
+        )))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> new-rate u0) err-invalid-exchange-rate)
+        (map-set supported-currencies currency-contract
+            (merge currency-info { usd-exchange-rate: new-rate })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-currency-status (currency-contract principal))
+    (let ((currency-info (unwrap! (map-get? supported-currencies currency-contract)
+            err-currency-not-supported
+        )))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set supported-currencies currency-contract
+            (merge currency-info { is-active: (not (get is-active currency-info)) })
+        )
+        (ok true)
+    )
+)
+
 (define-private (release-stakes (trade-id uint))
     (let (
             (trade (unwrap! (map-get? trades trade-id) err-not-found))
@@ -371,6 +536,68 @@
         (amount uint)
     )
     (as-contract (stx-transfer? amount tx-sender verifier))
+)
+
+(define-private (calculate-exchange-rate
+        (from-currency principal)
+        (to-currency principal)
+    )
+    (let (
+            (from-info (unwrap-panic (map-get? supported-currencies from-currency)))
+            (to-info (unwrap-panic (map-get? supported-currencies to-currency)))
+            (from-rate (get usd-exchange-rate from-info))
+            (to-rate (get usd-exchange-rate to-info))
+        )
+        (if (is-eq from-currency to-currency)
+            u1000000
+            (/ (* from-rate u1000000) to-rate)
+        )
+    )
+)
+
+(define-private (calculate-stx-equivalent
+        (currency-contract principal)
+        (amount uint)
+    )
+    (let ((currency-info (default-to {
+            usd-exchange-rate: (var-get stx-usd-rate),
+            decimal-places: u6,
+        }
+            (map-get? supported-currencies currency-contract)
+        )))
+        (/ (* amount (var-get stx-usd-rate))
+            (get usd-exchange-rate currency-info)
+        )
+    )
+)
+
+(define-private (transfer-supported-currency
+        (currency-contract principal)
+        (amount uint)
+        (sender principal)
+        (recipient principal)
+    )
+    (stx-transfer? amount sender recipient)
+)
+
+(define-private (release-multi-currency-funds (trade-id uint))
+    (let (
+            (trade (unwrap! (map-get? trades trade-id) err-not-found))
+            (currency-trade (map-get? multi-currency-trades trade-id))
+        )
+        (match currency-trade
+            multi-info (begin
+                (try! (as-contract (stx-transfer?
+                    (calculate-stx-equivalent (get base-currency multi-info)
+                        (get currency-locked-amount multi-info)
+                    )
+                    tx-sender (get importer trade)
+                )))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
 )
 
 (define-read-only (get-trade (trade-id uint))
@@ -574,5 +801,42 @@
         current-block: stacks-block-height,
         min-stake: (var-get min-stake-amount),
         verification-window: (var-get verification-window),
+        supported-currencies: (var-get supported-currencies-count),
     }
+)
+
+(define-read-only (get-supported-currency (currency-contract principal))
+    (map-get? supported-currencies currency-contract)
+)
+
+(define-read-only (get-multi-currency-trade (trade-id uint))
+    (map-get? multi-currency-trades trade-id)
+)
+
+(define-read-only (get-currency-balance
+        (user principal)
+        (currency principal)
+    )
+    (map-get? currency-balances {
+        user: user,
+        currency: currency,
+    })
+)
+
+(define-read-only (calculate-trade-value-in-currency
+        (base-amount uint)
+        (from-currency principal)
+        (to-currency principal)
+    )
+    (let ((exchange-rate (calculate-exchange-rate from-currency to-currency)))
+        (/ (* base-amount exchange-rate) u1000000)
+    )
+)
+
+(define-read-only (get-current-stx-rate)
+    (var-get stx-usd-rate)
+)
+
+(define-read-only (get-supported-currencies-count)
+    (var-get supported-currencies-count)
 )
