@@ -10,6 +10,7 @@
 (define-constant err-currency-not-supported (err u108))
 (define-constant err-insufficient-balance (err u109))
 (define-constant err-invalid-exchange-rate (err u110))
+(define-constant err-not-expired (err u111))
 
 (define-data-var trade-id-nonce uint u0)
 (define-data-var min-stake-amount uint u1000)
@@ -580,6 +581,26 @@
     (stx-transfer? amount sender recipient)
 )
 
+(define-private (refund-multi-currency-funds (trade-id uint))
+    (let (
+            (trade (unwrap! (map-get? trades trade-id) err-not-found))
+            (currency-trade (map-get? multi-currency-trades trade-id))
+        )
+        (match currency-trade
+            multi-info (begin
+                (try! (as-contract (stx-transfer?
+                    (calculate-stx-equivalent (get base-currency multi-info)
+                        (get currency-locked-amount multi-info)
+                    )
+                    tx-sender (get exporter trade)
+                )))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
 (define-private (release-multi-currency-funds (trade-id uint))
     (let (
             (trade (unwrap! (map-get? trades trade-id) err-not-found))
@@ -839,4 +860,85 @@
 
 (define-read-only (get-supported-currencies-count)
     (var-get supported-currencies-count)
+)
+
+(define-public (expire-trade (trade-id uint))
+    (let ((trade (unwrap! (map-get? trades trade-id) err-not-found)))
+        (asserts!
+            (or (is-eq (get status trade) "pending") (is-eq (get status trade) "assigned"))
+            err-invalid-status
+        )
+        (asserts! (>= stacks-block-height (get expires-at trade)) err-not-expired)
+        (try! (release-stakes trade-id))
+        (try! (refund-multi-currency-funds trade-id))
+        (map-set trades trade-id (merge trade { status: "expired" }))
+        (ok true)
+    )
+)
+
+(define-map trade-audit-counters
+    uint
+    { count: uint }
+)
+
+(define-map trade-audit-logs
+    {
+        trade-id: uint,
+        log-id: uint,
+    }
+    {
+        author: principal,
+        label: (string-ascii 32),
+        data-hash: (buff 32),
+        created-at: uint,
+    }
+)
+
+(define-public (log-trade-audit
+        (trade-id uint)
+        (label (string-ascii 32))
+        (data-hash (buff 32))
+    )
+    (let (
+            (trade (unwrap! (map-get? trades trade-id) err-not-found))
+            (is-exporter (is-eq tx-sender (get exporter trade)))
+            (is-importer (is-eq tx-sender (get importer trade)))
+            (is-verifier (match (get verifier trade)
+                v (is-eq tx-sender v)
+                false
+            ))
+            (participant-ok (or is-exporter (or is-importer is-verifier)))
+            (counter (default-to { count: u0 } (map-get? trade-audit-counters trade-id)))
+            (next-id (+ (get count counter) u1))
+        )
+        (asserts! participant-ok err-unauthorized)
+        (map-set trade-audit-counters trade-id { count: next-id })
+        (map-set trade-audit-logs {
+            trade-id: trade-id,
+            log-id: next-id,
+        } {
+            author: tx-sender,
+            label: label,
+            data-hash: data-hash,
+            created-at: stacks-block-height,
+        })
+        (ok next-id)
+    )
+)
+
+(define-read-only (get-trade-audit-log
+        (trade-id uint)
+        (log-id uint)
+    )
+    (map-get? trade-audit-logs {
+        trade-id: trade-id,
+        log-id: log-id,
+    })
+)
+
+(define-read-only (get-trade-audit-count (trade-id uint))
+    (match (map-get? trade-audit-counters trade-id)
+        c (get count c)
+        u0
+    )
 )
