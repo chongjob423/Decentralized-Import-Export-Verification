@@ -11,12 +11,15 @@
 (define-constant err-insufficient-balance (err u109))
 (define-constant err-invalid-exchange-rate (err u110))
 (define-constant err-not-expired (err u111))
+(define-constant err-invalid-fee (err u112))
 
 (define-data-var trade-id-nonce uint u0)
 (define-data-var min-stake-amount uint u1000)
 (define-data-var verification-window uint u1440)
 (define-data-var stx-usd-rate uint u100000)
 (define-data-var supported-currencies-count uint u0)
+(define-data-var protocol-fee-bps uint u50)
+(define-data-var protocol-fee-accrued uint u0)
 
 (define-map trades
     uint
@@ -310,6 +313,9 @@
             (trade (unwrap! (map-get? trades trade-id) err-not-found))
             (verifier-address (unwrap! (get verifier trade) err-unauthorized))
             (verifier-info (unwrap! (map-get? verifiers verifier-address) err-not-found))
+            (trade-value (get value trade))
+            (protocol-fee (/ (* trade-value (var-get protocol-fee-bps)) u10000))
+            (verifier-fee (/ trade-value u100))
             (new-status (if verification-result
                 "verified"
                 "rejected"
@@ -344,7 +350,10 @@
             (begin
                 (try! (release-stakes trade-id))
                 (try! (release-multi-currency-funds trade-id))
-                (try! (pay-verifier verifier-address (/ (get value trade) u100)))
+                (var-set protocol-fee-accrued
+                    (+ (var-get protocol-fee-accrued) protocol-fee)
+                )
+                (try! (pay-verifier verifier-address verifier-fee))
                 (ok verification-result)
             )
             (ok verification-result)
@@ -445,6 +454,15 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set verification-window new-window)
+        (ok true)
+    )
+)
+
+(define-public (update-protocol-fee (new-fee-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-fee-bps u10000) err-invalid-fee)
+        (var-set protocol-fee-bps new-fee-bps)
         (ok true)
     )
 )
@@ -862,6 +880,14 @@
     (var-get supported-currencies-count)
 )
 
+(define-read-only (get-protocol-fee-bps)
+    (var-get protocol-fee-bps)
+)
+
+(define-read-only (get-protocol-fee-accrued)
+    (var-get protocol-fee-accrued)
+)
+
 (define-public (expire-trade (trade-id uint))
     (let ((trade (unwrap! (map-get? trades trade-id) err-not-found)))
         (asserts!
@@ -940,5 +966,15 @@
     (match (map-get? trade-audit-counters trade-id)
         c (get count c)
         u0
+    )
+)
+
+(define-public (withdraw-protocol-fees (recipient principal))
+    (let ((amount (var-get protocol-fee-accrued)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> amount u0) err-invalid-fee)
+        (var-set protocol-fee-accrued u0)
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        (ok amount)
     )
 )
